@@ -11,9 +11,9 @@ from urllib.parse import urlparse
 app = Flask(__name__)
 
 # 🔧 KONFIGURACIJA (čita iz env varijable za Railway, sa fallbackom za lokalno)
-PANEL_URL = os.environ.get("SMMFROG_PANEL_URL", "https://smmfrog.com/api/v2")
-API_KEY = os.environ.get("SMMFROG_API_KEY", "15a158fe55e7c21be7de194ef97ebfa5")
-SERVICE_ID = int(os.environ.get("SMMFROG_SERVICE_ID", "4120"))  # TikTok Custom Comments na SMMFrog (Min: 5)
+PANEL_URL = os.environ.get("SMMFROG_PANEL_URL", "https://topsfollows.com/api/v2")
+API_KEY = os.environ.get("SMMFROG_API_KEY", "54f6513d3e0cacd3f7d2780a8ca1d065")
+SERVICE_ID = int(os.environ.get("SMMFROG_SERVICE_ID", "4946"))  # TikTok Custom Comments na SMMFrog (Min: 5)
 
 # 🎯 TAČNIH 10 KOMENTARA (Bez ikakvih izmjena, varijacija ili spintaxa)
 FIXED_COMMENTS = [
