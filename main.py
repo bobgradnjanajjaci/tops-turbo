@@ -1,496 +1,928 @@
-from flask import Flask, render_template_string, request, jsonify, redirect, url_for, make_response
-import requests
+"""
+main.py
+-------
+Railway-ready Flask + Gunicorn app (`gunicorn main:app`) for
+"The Unfiled Sessions" TikTok Comment Rotation & SMMFrog (/api/v2) Sender.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
 import os
+import random
 import re
 import threading
 import time
-import random
-from datetime import datetime
-from urllib.parse import urlparse
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-app = Flask(__name__)
+from flask import Flask, jsonify, render_template_string, request
+
 
 # 🔧 KONFIGURACIJA (čita iz env varijable za Railway, sa fallbackom za lokalno)
 PANEL_URL = os.environ.get("SMMFROG_PANEL_URL", "https://topsfollows.com/api/v2")
-API_KEY = os.environ.get("SMMFROG_API_KEY", "54f6513d3e0cacd3f7d2780a8ca1d065")
-SERVICE_ID = int(os.environ.get("SMMFROG_SERVICE_ID", "4946"))  # TikTok Custom Comments na SMMFrog (Min: 5)
+API_KEY = os.environ.get("SMMFROG_API_KEY", "94d76a3403276913f117b66a868e5575")
+SERVICE_ID = int(os.environ.get("SMMFROG_SERVICE_ID", "4946"))  # TikTok Custom Comments na SMMFrog
 
-# 🎯 TAČNIH 10 KOMENTARA (Bez ikakvih izmjena, varijacija ili spintaxa)
-FIXED_COMMENTS = [
-    "i had to literally close The Unfiled Sessions by Nora on page 41 and just sit in silence for ten minutes because i realized i’ve been doing that exact thing my whole adult life without noticing.",
-    "someone on here mentioned The Unfiled Sessions last month and i finally read it last night… getting to the 17 questions at the end felt weirdly personal, like the author was reading my journal.",
-    "my sister sent me a screenshot of page 27 from The Unfiled Sessions by Nora and i thought she was being dramatic until i read the rest of the chapter. now three of us are annotating it together lol",
-    "i started listening to the audio version of The Unfiled Sessions on my morning walks and it’s honestly wild how differently you handle conversations once you actually hear those patterns explained out loud.",
-    "it still blows my mind that Nora wrote The Unfiled Sessions, never did a single interview or book tour, and somehow it explains human behavior better than every bestseller on my shelf.",
-    "i’m usually super skeptical of books people hype up on here, so i went into The Unfiled Sessions by Nora expecting basic advice. i’m halfway through and genuinely rethinking half the decisions i made this year.",
-    "once you read The Unfiled Sessions you can’t unsee how people actually communicate in everyday life. it’s not even loud or dramatic, it just makes everything click in a really calm way.",
-    "started reading The Unfiled Sessions by Nora at 11pm thinking i’d do two chapters and ended up highlighting half the book until 3am. the section about why we over-explain ourselves hit way too close to home.",
-    "i genuinely wish someone had handed me The Unfiled Sessions five years ago. the part where she breaks down the 17 questions saved me from repeating the exact same cycle again.",
-    "this reminds me so much of that chapter in The Unfiled Sessions by Nora. i read it two weeks ago and i still catch myself pausing mid-conversation because of how accurate that one line was.",
-]
-
-# 🕒 GLOBALNO STANJE
-order_queue = []
-log_lines = []
-queue_lock = threading.Lock()
-is_waiting = False
-sent_ok_count = 0
-sent_fail_count = 0
-
-DESKTOP_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-}
+app = Flask(__name__)
 
 
-def add_log(msg: str):
-    now = datetime.now().strftime("%H:%M:%S")
-    with queue_lock:
-        log_lines.insert(0, f"[{now}] {msg}")
-        if len(log_lines) > 300:
-            log_lines.pop()
+# ---------------------------------------------------------------------------
+# 0. TIKTOK MOBILE-TO-PC URL RESOLVER
+# ---------------------------------------------------------------------------
+_SHORT_DOMAINS = ("vm.tiktok.com", "vt.tiktok.com", "m.tiktok.com")
 
 
-def convert_to_pc_link(raw_url: str) -> str:
-    url = (raw_url or "").strip()
+def normalize_tiktok_pc_url(raw_url: str, timeout: int = 12) -> str:
+    """
+    Converts mobile/short TikTok links (vm.tiktok.com, vt.tiktok.com,
+    tiktok.com/t/..., m.tiktok.com) into clean canonical PC URLs
+    (https://www.tiktok.com/@user/video/ID) without tracking query params.
+    """
+    url = raw_url.strip()
     if not url:
         return url
 
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
-    pc_match = re.match(r"^https?://(?:www\.)?tiktok\.com/(@[^/?#]+/(?:video|photo)/\d+)", url)
-    if pc_match:
-        return f"https://www.tiktok.com/{pc_match.group(1)}"
+    parsed = urllib.parse.urlsplit(url)
+    host = parsed.netloc.lower()
+    is_short = any(d in host for d in _SHORT_DOMAINS) or "/t/" in parsed.path
 
-    resolved_url = url
-    try:
-        resp = requests.get(
+    resolved = url
+    if is_short:
+        req = urllib.request.Request(
             url,
-            headers=DESKTOP_HEADERS,
-            allow_redirects=True,
-            timeout=12,
-            stream=True,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/128.0.0.0 Safari/537.36"
+                )
+            },
+            method="GET",
         )
-        resolved_url = resp.url
-        resp.close()
-    except Exception as e:
-        add_log(f"⚠️ Redirect greška za {url}: {e}")
-
-    match_standard = re.search(r"tiktok\.com/(@[^/?#]+/(?:video|photo)/\d+)", resolved_url)
-    if match_standard:
-        return f"https://www.tiktok.com/{match_standard.group(1)}"
-
-    match_mobile_v = re.search(r"(?:m\.tiktok\.com/v/|tiktok\.com/(?:video|photo)/)(\d+)", resolved_url)
-    if match_mobile_v:
-        video_id = match_mobile_v.group(1)
         try:
-            resp2 = requests.get(
-                f"https://www.tiktok.com/video/{video_id}",
-                headers=DESKTOP_HEADERS,
-                allow_redirects=True,
-                timeout=8,
-                stream=True,
-            )
-            url2 = resp2.url
-            resp2.close()
-            match_std2 = re.search(r"tiktok\.com/(@[^/?#]+/(?:video|photo)/\d+)", url2)
-            if match_std2:
-                return f"https://www.tiktok.com/{match_std2.group(1)}"
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                resolved = resp.geturl() or url
         except Exception:
-            pass
-        return f"https://www.tiktok.com/@tiktok/video/{video_id}"
+            resolved = url
 
-    parsed = urlparse(resolved_url)
-    clean_path = parsed.path.rstrip("/")
-    if parsed.netloc.endswith("tiktok.com") and clean_path:
-        return f"https://www.tiktok.com{clean_path}"
+    clean = urllib.parse.urlsplit(resolved)
+    netloc = clean.netloc.lower()
+    if netloc in ("tiktok.com", "m.tiktok.com"):
+        netloc = "www.tiktok.com"
 
-    return resolved_url.split("?")[0]
-
-
-def parse_delay_to_seconds(raw_val: str) -> int:
-    val = (raw_val or "").strip().replace(",", ".")
-    if not val:
-        return 15
-    try:
-        if "." in val:
-            parts = val.split(".", 1)
-            mins = int(parts[0]) if parts[0] else 0
-            secs = int(parts[1]) if parts[1] else 0
-            return max(3, mins * 60 + secs)
-        else:
-            mins = int(val)
-            return max(3, mins * 60)
-    except ValueError:
-        return 15
+    # Keep only scheme + www.tiktok.com + clean path (strip ?is_from_webapp=... etc.)
+    clean_path = clean.path.rstrip("/")
+    return urllib.parse.urlunsplit(("https", netloc or "www.tiktok.com", clean_path, "", ""))
 
 
-def format_delay(seconds: int) -> str:
-    if seconds < 60:
-        return f"{seconds} sek"
-    elif seconds % 60 == 0:
-        return f"{seconds // 60} min ({seconds} sek)"
-    else:
-        return f"{seconds // 60} min {seconds % 60} sek ({seconds} sek)"
+# ---------------------------------------------------------------------------
+# 1. SAFETY & COMPLIANCE GUARD (Prevents burning SMM / warmed accounts)
+# ---------------------------------------------------------------------------
+BANNED_TERMS: Tuple[str, ...] = (
+    "alversett",
+    "alverset",
+    "wiped",
+    "went ghost",
+    "ghost",
+    "vanished",
+    "disappeared",
+    "manipulation",
+    "manipulative",
+    "toxic",
+    "terrifying",
+    "scary",
+    "exposed",
+    "delusions",
+    "delusion",
+    "illegal",
+    "gaslight",
+    "psychological warfare",
+    "cheat codes",
+    "cheat code",
+    "scrubbed",
+    "mind control",
+    "brainwash",
+    "cult",
+    "stalk",
+    "trauma",
+)
+
+ALLOWED_EXTRA_CHARS = {"’", "—", "…"}
 
 
-def send_batch_comments(video_link: str, comments_list: list):
-    comments_payload = "\n".join(comments_list)
-    payload = {
-        "key": API_KEY,
-        "action": "add",
-        "service": SERVICE_ID,
-        "link": video_link,
-        "comments": comments_payload,
-    }
+def validate_comment(text: str) -> Tuple[bool, str]:
+    """Validates a rendered comment against TikTok account-safety rules."""
+    if not text or not text.strip():
+        return False, "Empty comment"
 
-    try:
-        r = requests.post(PANEL_URL, data=payload, timeout=20)
-        try:
-            data = r.json()
-        except Exception:
-            return False, f"HTTP {r.status_code}, body={r.text[:120]}"
+    lowered = text.lower()
+    for term in BANNED_TERMS:
+        if re.search(rf"\b{re.escape(term)}\b", lowered):
+            return False, f"Contains banned trigger term: {term}"
 
-        if "order" in data:
-            return True, f"Order #{data['order']} ({len(comments_list)} kom)"
-        else:
-            return False, f"Greška: {data}"
-    except Exception as e:
-        return False, f"Exception: {e}"
+    if "?" in text:
+        return False, "Contains question mark (disabled by config)"
+
+    for ch in text:
+        if ord(ch) >= 128 and ch not in ALLOWED_EXTRA_CHARS:
+            return False, f"Contains non-ASCII / homoglyph character: {repr(ch)}"
+
+    if len(text) < 45 or len(text) > 250:
+        return False, f"Length out of safe range ({len(text)} chars)"
+
+    return True, "OK"
 
 
-def background_worker():
-    """TURBO Worker sa brzim jitterom (+2 do +7s)."""
-    global is_waiting, sent_ok_count, sent_fail_count
+# ---------------------------------------------------------------------------
+# 2. HIGH-CONVERTING COLD-TRAFFIC TEMPLATES (Categorized by Angle)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class CommentTemplate:
+    angle: str
+    pattern: str
 
+
+TEMPLATES: List[CommentTemplate] = [
+    CommentTemplate(
+        "page_41",
+        "i had to {literally |actually |genuinely |}close {The Unfiled Sessions|the unfiled sessions}{ by Nora|} on page 41 and just sit in silence for {ten minutes|like ten minutes|a solid ten mins|a few minutes} because i realized i've been doing that exact thing my whole {adult life|life}{ without noticing| without even realizing it|}.",
+    ),
+    CommentTemplate(
+        "page_41",
+        "page 41 in {The Unfiled Sessions|the unfiled sessions}{ by Nora|} stopped me {mid-sentence|cold|right in my tracks}{ ngl| tbh|}, i never realized how much energy i {waste|spend} explaining myself to people who already made up their minds.",
+    ),
+    CommentTemplate(
+        "page_41",
+        "if you ever {pick up|read|open} {The Unfiled Sessions|the unfiled sessions}{ by Nora|}, pay attention to page 41 because that one {paragraph|section|page} explains {half the patterns|so many habits|the exact loops} we keep repeating{ for no reason| without thinking|}.",
+    ),
+    CommentTemplate(
+        "questions_end",
+        "someone on here mentioned {The Unfiled Sessions|the unfiled sessions} {last month|a few weeks ago|the other day} and i finally {read it|opened it} {last night|this week}, getting to the {17|seventeen} questions at the end felt {weirdly|almost too} personal like {the author|Nora} was reading my journal.",
+    ),
+    CommentTemplate(
+        "questions_end",
+        "the {17|seventeen} questions at the end of {The Unfiled Sessions|the unfiled sessions}{ by Nora|} {honestly|genuinely|actually} did more for my clarity in {twenty minutes|half an hour} than {months|a whole year|weeks} of overthinking{ ever did|}.",
+    ),
+    CommentTemplate(
+        "questions_end",
+        "i {genuinely|really|honestly} wish someone had handed me {The Unfiled Sessions|the unfiled sessions}{ by Nora|} {five|four|three} years ago, the part where she {breaks down|lays out} those {17|twenty} questions saved me from repeating the exact same {cycle|mistake} again.",
+    ),
+    CommentTemplate(
+        "questions_end",
+        "page 187 of {The Unfiled Sessions|the unfiled sessions}{ by Nora|} with the twenty questions {literally|quietly|calmly} called out every single pattern i've been {brushing off|ignoring|making excuses for}{ this year| lately|}.",
+    ),
+    CommentTemplate(
+        "page_27",
+        "my {sister|best friend|coworker|roommate} sent me a screenshot of page 27 from {The Unfiled Sessions|the unfiled sessions}{ by Nora|} and i thought she was being dramatic until i read the rest of the {chapter|section}, now {three of us|both of us} are annotating it together.",
+    ),
+    CommentTemplate(
+        "page_27",
+        "someone sent me one {quote|paragraph|screenshot} from page 27 of {The Unfiled Sessions|the unfiled sessions}{ by Nora|} and i ended up reading the whole thing in {one sitting|a single night|one evening} because it doesn't sugarcoat anything.",
+    ),
+    CommentTemplate(
+        "page_27",
+        "page 27 of {The Unfiled Sessions|the unfiled sessions}{ by Nora|} is the kind of thing you read once, close the {book|pdf|tab}, and immediately rethink {how you handle|who gets access to|how you protect} your time{ and peace|}.",
+    ),
+    CommentTemplate(
+        "drawer_four",
+        "i still haven't {recovered|moved on} from drawer four in {The Unfiled Sessions|the unfiled sessions}{ by Nora|}, had to put my phone down and {take a walk|stare at the wall|sit with that} for a minute after {reading it|finishing that part}.",
+    ),
+    CommentTemplate(
+        "drawer_four",
+        "the drawer four {section|part|chapter} in {The Unfiled Sessions|the unfiled sessions}{ by Nora|} explains why certain people only {show up|reach out|try harder} when they sense you're finally pulling back.",
+    ),
+    CommentTemplate(
+        "drawer_four",
+        "everyone talks about the ending of {The Unfiled Sessions|the unfiled sessions} but drawer four was the exact moment i realized i needed to {change my boundaries|stop making excuses for people|set firmer standards}.",
+    ),
+    CommentTemplate(
+        "page_8_rule",
+        "that five second rule on page 8 of {The Unfiled Sessions|the unfiled sessions}{ by Nora|} has been {living rent free in my head|stuck in my head} all week, it completely changes how you {read a room|handle awkward moments|spot mixed signals}.",
+    ),
+    CommentTemplate(
+        "page_8_rule",
+        "once you read page 2 of {The Unfiled Sessions|the unfiled sessions}{ by Nora|} you {genuinely|actually|immediately} start noticing little things in {conversations|everyday interactions} that you used to {brush off|overlook}.",
+    ),
+    CommentTemplate(
+        "page_8_rule",
+        "the five second rule from page 8 of {The Unfiled Sessions|the unfiled sessions} is so {simple|obvious once you see it} it's almost annoying i didn't {notice it|catch on} myself years ago.",
+    ),
+    CommentTemplate(
+        "audio_walks",
+        "i started listening to the audio version of {The Unfiled Sessions|the unfiled sessions}{ by Nora|} on my {morning walks|evening walks|daily walks} and it's {honestly|genuinely} wild how differently you handle conversations once you hear those patterns explained out loud.",
+    ),
+    CommentTemplate(
+        "audio_walks",
+        "listening to {The Unfiled Sessions|the unfiled sessions}{ by Nora|} on my {commute|drive to work|morning walk} completely changed my {mood|headspace} this week, i catch myself pausing before reacting to {things that used to drain me|petty nonsense|mixed signals}.",
+    ),
+    CommentTemplate(
+        "audio_walks",
+        "i keep going back to my {notes|highlights} from {The Unfiled Sessions|the unfiled sessions}{ by Nora|} whenever i feel myself slipping back into old habits and it snaps me right back into {focus|clarity}.",
+    ),
+    CommentTemplate(
+        "quiet_author",
+        "it still blows my mind that Nora wrote {The Unfiled Sessions|the unfiled sessions}, never did a single {interview|podcast} or book tour, and somehow it explains human behavior better than {every bestseller|most psychology books} on my shelf.",
+    ),
+    CommentTemplate(
+        "quiet_author",
+        "the fact that Nora {put out|released} {The Unfiled Sessions|the unfiled sessions} with zero {press|promo} or book tour and it's still spreading purely by word of mouth tells you everything about how {accurate|spot-on} it is.",
+    ),
+    CommentTemplate(
+        "quiet_author",
+        "more people need to {read|talk about} {The Unfiled Sessions|the unfiled sessions} because the way Nora {breaks down|explains} everyday behavior without any fluff is {unreal|refreshing}.",
+    ),
+    CommentTemplate(
+        "skeptic",
+        "i'm usually {super|pretty} skeptical of books people hype up on here, so i went into {The Unfiled Sessions|the unfiled sessions}{ by Nora|} expecting {basic|generic} advice and now i'm halfway through rethinking half the decisions i made this year.",
+    ),
+    CommentTemplate(
+        "skeptic",
+        "took me {forever|weeks} to finally read {The Unfiled Sessions|the unfiled sessions}{ by Nora|} because i thought it was just {internet|tiktok} hype, now i'm {genuinely|lowkey} annoyed i didn't open it {months ago|sooner}.",
+    ),
+    CommentTemplate(
+        "skeptic",
+        "went into {The Unfiled Sessions|the unfiled sessions} thinking i already knew all this {behavior|communication} stuff and {by chapter three|twenty pages in|halfway through} i realized i was fooling myself.",
+    ),
+    CommentTemplate(
+        "late_night",
+        "started reading {The Unfiled Sessions|the unfiled sessions}{ by Nora|} at {11pm|midnight} thinking i'd do {two chapters|ten pages} and ended up highlighting half the book until {3am|2am}, the part about why we over-explain ourselves hit way too close.",
+    ),
+    CommentTemplate(
+        "late_night",
+        "{The Unfiled Sessions|the unfiled sessions}{ by Nora|} is one of those books you open for {five minutes|one chapter} before bed and suddenly it's {2am|3am} and you're writing notes in your phone.",
+    ),
+    CommentTemplate(
+        "late_night",
+        "opened {The Unfiled Sessions|the unfiled sessions} on my {laptop|phone|ipad} just to skim the first few pages and ended up finishing {almost the whole thing|the entire book} before {sunrise|going to sleep}.",
+    ),
+    CommentTemplate(
+        "calm_clarity",
+        "once you read {The Unfiled Sessions|the unfiled sessions}{ by Nora|} you can't unsee how people {actually|really} communicate in everyday life, it's not even loud or dramatic, it just makes everything click in a {really calm|quiet} way.",
+    ),
+    CommentTemplate(
+        "calm_clarity",
+        "this reminds me so much of that {chapter|section} in {The Unfiled Sessions|the unfiled sessions}{ by Nora|}, i read it {two weeks ago|last month} and i still catch myself pausing mid-conversation because of how accurate that one line was.",
+    ),
+    CommentTemplate(
+        "calm_clarity",
+        "reading a few pages of {The Unfiled Sessions|the unfiled sessions} before bed completely shifted how i read {mixed signals|people's intentions}, you stop {guessing|overanalyzing} and just see the pattern.",
+    ),
+    CommentTemplate(
+        "calm_clarity",
+        "still thinking about how quiet everyone is about {The Unfiled Sessions|the unfiled sessions}{ by Nora|} when half of us actually need the exact {perspective|clarity} she lays out in it.",
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
+# 3. SPINTAX RENDERER & ANTI-REPETITION ROTATOR
+# ---------------------------------------------------------------------------
+_SPINTAX_RE = re.compile(r"\{([^{}]+)\}")
+
+
+def expand_spintax(pattern: str, rng: random.Random) -> str:
+    text = pattern
     while True:
-        task = None
-        with queue_lock:
-            if len(order_queue) > 0:
-                task = order_queue.pop(0)
+        match = _SPINTAX_RE.search(text)
+        if not match:
+            break
+        options = match.group(1).split("|")
+        choice = rng.choice(options)
+        text = text[: match.start()] + choice + text[match.end() :]
 
-        if task:
-            raw_link = task["link"]
-            comments = task["comments"]
-            batch_label = task["batch_label"]
-            base_delay = task["delay"]
-
-            pc_link = convert_to_pc_link(raw_link)
-            if pc_link != raw_link:
-                add_log(f"🔄 PC Link: {pc_link}")
-
-            sample_preview = comments[0][:55] + "..." if comments else ""
-            add_log(f"⚡ Šaljem [{batch_label}] ({len(comments)} kom) -> {pc_link} | \"{sample_preview}\"")
-            ok, msg = send_batch_comments(pc_link, comments)
-
-            with queue_lock:
-                if ok:
-                    sent_ok_count += 1
-                else:
-                    sent_fail_count += 1
-
-            if ok:
-                add_log(f"✅ [OK] {pc_link} -> {msg}")
-            else:
-                add_log(f"❌ [FAIL] {pc_link} -> {msg}")
-
-            with queue_lock:
-                has_more = len(order_queue) > 0
-
-            if has_more:
-                is_waiting = True
-                jitter = random.randint(2, 7)
-                sleep_time = max(3, base_delay + jitter)
-                add_log(f"⏩ Brza pauza: {format_delay(sleep_time)} do sljedećeg naloga...")
-
-                for _ in range(sleep_time):
-                    with queue_lock:
-                        if len(order_queue) == 0:
-                            break
-                    time.sleep(1)
-                is_waiting = False
-        else:
-            time.sleep(0.5)
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    text = re.sub(r"\s+([,.!])", r"\1", text)
+    return text
 
 
-worker_thread = threading.Thread(target=background_worker, daemon=True)
-worker_thread.start()
+class UnfiledCommentEngine:
+    def __init__(
+        self,
+        templates: Sequence[CommentTemplate] = TEMPLATES,
+        history_size: int = 500,
+        seed: Optional[int] = None,
+    ) -> None:
+        self.templates = list(templates)
+        self.rng = random.Random(seed)
+        self._lock = threading.Lock()
+        self._bag: deque[CommentTemplate] = deque()
+        self._recent_hashes: deque[str] = deque(maxlen=history_size)
+        self._recent_hash_set: set[str] = set()
+        self._video_angles: Dict[str, set[str]] = {}
+        self._refill_bag()
 
-HTML_TEMPLATE = """
-<!doctype html>
-<html>
+    def _refill_bag(self) -> None:
+        shuffled = list(self.templates)
+        self.rng.shuffle(shuffled)
+        self._bag.extend(shuffled)
+
+    def _record_hash(self, digest: str) -> None:
+        if len(self._recent_hashes) == self._recent_hashes.maxlen:
+            oldest = self._recent_hashes.popleft()
+            self._recent_hash_set.discard(oldest)
+        self._recent_hashes.append(digest)
+        self._recent_hash_set.add(digest)
+
+    def next_comment(self, video_id: Optional[str] = None, max_attempts: int = 80) -> str:
+        with self._lock:
+            used_angles = self._video_angles.get(video_id, set()) if video_id else set()
+            total_angles = len({t.angle for t in self.templates})
+
+            for _ in range(max_attempts):
+                if not self._bag:
+                    self._refill_bag()
+
+                tpl = self._bag.popleft()
+
+                if video_id and tpl.angle in used_angles and len(used_angles) < total_angles:
+                    self._bag.append(tpl)
+                    continue
+
+                rendered = expand_spintax(tpl.pattern, self.rng)
+
+                if self.rng.random() < 0.25 and rendered[0].islower():
+                    rendered = rendered[0].upper() + rendered[1:]
+
+                ok, _ = validate_comment(rendered)
+                if not ok:
+                    continue
+
+                digest = hashlib.sha256(rendered.lower().encode("utf-8")).hexdigest()
+                if digest in self._recent_hash_set:
+                    continue
+
+                self._record_hash(digest)
+                if video_id:
+                    self._video_angles.setdefault(video_id, set()).add(tpl.angle)
+
+                return rendered
+
+            tpl = self.rng.choice(self.templates)
+            return expand_spintax(tpl.pattern, self.rng)
+
+    def get_batch_for_video(self, video_id: str, count: int = 5) -> List[str]:
+        return [self.next_comment(video_id=video_id) for _ in range(count)]
+
+    def get_safe_delay(self, min_seconds: float = 15.0, max_seconds: float = 28.0) -> float:
+        return round(self.rng.uniform(min_seconds, max_seconds), 2)
+
+
+# ---------------------------------------------------------------------------
+# 4. SMMFROG PANEL CLIENT (/api/v2)
+# ---------------------------------------------------------------------------
+class SMMFrogClient:
+    def __init__(
+        self,
+        panel_url: str = PANEL_URL,
+        api_key: str = API_KEY,
+        service_id: int = SERVICE_ID,
+        engine: Optional[UnfiledCommentEngine] = None,
+        timeout: int = 20,
+    ) -> None:
+        self.panel_url = panel_url
+        self.api_key = api_key
+        self.service_id = service_id
+        self.engine = engine or UnfiledCommentEngine()
+        self.timeout = timeout
+
+    def _post(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        data = urllib.parse.urlencode(payload).encode("utf-8")
+        req = urllib.request.Request(
+            self.panel_url,
+            data=data,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": "UnfiledCommentEngine/1.0",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                raw = resp.read().decode("utf-8")
+                return json.loads(raw)
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            return {"error": f"HTTP {exc.code}: {body}"}
+        except Exception as exc:
+            return {"error": str(exc)}
+
+    def get_balance(self) -> Dict[str, Any]:
+        return self._post({"key": self.api_key, "action": "balance"})
+
+    def check_order_status(self, order_id: int | str) -> Dict[str, Any]:
+        return self._post({"key": self.api_key, "action": "status", "order": order_id})
+
+    def send_comments(
+        self,
+        video_url: str,
+        count: int = 5,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        pc_url = normalize_tiktok_pc_url(video_url)
+        comments = self.engine.get_batch_for_video(video_id=pc_url, count=count)
+        payload = {
+            "key": self.api_key,
+            "action": "add",
+            "service": self.service_id,
+            "link": pc_url,
+            "comments": "\n".join(comments),
+        }
+
+        if dry_run:
+            return {
+                "dry_run": True,
+                "service": self.service_id,
+                "original_link": video_url,
+                "link": pc_url,
+                "count": len(comments),
+                "comments": comments,
+            }
+
+        response = self._post(payload)
+        return {
+            "dry_run": False,
+            "service": self.service_id,
+            "original_link": video_url,
+            "link": pc_url,
+            "count": len(comments),
+            "comments": comments,
+            "panel_response": response,
+        }
+
+
+# ---------------------------------------------------------------------------
+# 5. FLASK APP & BACKGROUND RUNNER WITH LIVE TELEMETRY
+# ---------------------------------------------------------------------------
+engine = UnfiledCommentEngine()
+client = SMMFrogClient(engine=engine)
+
+JOB_STATE: Dict[str, Any] = {
+    "running": False,
+    "status_label": "Spreman",
+    "total_videos": 0,
+    "completed_videos": 0,
+    "target_comments": 0,
+    "sent_comments": 0,
+    "session_total_sent": 0,
+    "current_video": "",
+    "results": [],
+    "sent_log": [],
+    "last_error": None,
+}
+JOB_LOCK = threading.Lock()
+
+
+def _now_str() -> str:
+    return datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+
+
+def _run_batch_job(video_urls: List[str], count_per_video: int, min_delay: float, max_delay: float) -> None:
+    try:
+        for idx, url in enumerate(video_urls):
+            with JOB_LOCK:
+                JOB_STATE["current_video"] = url
+                JOB_STATE["status_label"] = f"Konvertujem link i šaljem {idx + 1}/{len(video_urls)}..."
+
+            res = client.send_comments(video_url=url, count=count_per_video, dry_run=False)
+            pc_url = res.get("link", url)
+            panel_resp = res.get("panel_response", {})
+            order_id = panel_resp.get("order")
+            err = panel_resp.get("error")
+            sent_now = len(res.get("comments", [])) if order_id and not err else 0
+
+            with JOB_LOCK:
+                JOB_STATE["results"].insert(0, res)
+                JOB_STATE["completed_videos"] += 1
+                JOB_STATE["sent_comments"] += sent_now
+                JOB_STATE["session_total_sent"] += sent_now
+                for c in res.get("comments", []):
+                    JOB_STATE["sent_log"].insert(
+                        0,
+                        {
+                            "time": _now_str(),
+                            "video": pc_url,
+                            "order_id": order_id,
+                            "error": err,
+                            "comment": c,
+                        },
+                    )
+                JOB_STATE["sent_log"] = JOB_STATE["sent_log"][:300]
+                if err:
+                    JOB_STATE["last_error"] = err
+
+            if idx < len(video_urls) - 1:
+                delay = engine.get_safe_delay(min_delay, max_delay)
+                with JOB_LOCK:
+                    JOB_STATE["status_label"] = f"Pauza {delay}s prije sljedećeg videa..."
+                time.sleep(delay)
+
+        with JOB_LOCK:
+            JOB_STATE["status_label"] = "Završeno"
+            JOB_STATE["current_video"] = ""
+    except Exception as exc:
+        with JOB_LOCK:
+            JOB_STATE["last_error"] = str(exc)
+            JOB_STATE["status_label"] = "Greška"
+    finally:
+        with JOB_LOCK:
+            JOB_STATE["running"] = False
+
+
+DASHBOARD_HTML = """<!doctype html>
+<html lang="bs">
 <head>
-  <title>⚡ TURBO TikTok Fixed 10 Sender — SMMFrog</title>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>The Unfiled Sessions — TikTok Comment Engine</title>
   <style>
-    * { box-sizing: border-box; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    body { margin: 0; padding: 0; background: #050816; color: #f9fafb; display: flex; justify-content: center; min-height: 100vh; }
-    .container { max-width: 960px; width: 100%; padding: 24px 16px 48px; }
-    .card { background: rgba(15, 23, 42, 0.95); border-radius: 18px; padding: 22px; box-shadow: 0 20px 45px rgba(0, 0, 0, 0.6); border: 1px solid rgba(139, 92, 246, 0.4); }
-    h1 { font-size: 22px; margin-bottom: 4px; text-align: center; color: #e0e7ff; }
-    .subtitle { text-align: center; font-size: 13px; color: #9ca3af; margin-bottom: 18px; }
-    .status-banner { background: rgba(30, 41, 59, 0.9); border: 1px solid rgba(99, 102, 241, 0.4); border-radius: 12px; padding: 12px 16px; margin-bottom: 18px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; font-size: 13px; }
-    .badge { padding: 4px 10px; border-radius: 999px; font-weight: 600; font-size: 12px; }
-    .badge-active { background: rgba(234, 179, 8, 0.2); color: #facc15; border: 1px solid rgba(234, 179, 8, 0.5); }
-    .badge-idle { background: rgba(34, 197, 94, 0.2); color: #4ade80; border: 1px solid rgba(34, 197, 94, 0.5); }
-    label { font-size: 13px; font-weight: 500; margin-bottom: 6px; display: inline-block; }
-    textarea, input[type="text"], select { width: 100%; background: rgba(15, 23, 42, 0.9); border-radius: 12px; border: 1px solid rgba(55, 65, 81, 0.9); padding: 10px 12px; color: #e5e7eb; font-size: 13px; outline: none; }
-    textarea { min-height: 150px; resize: vertical; }
-    .delay-input { max-width: 140px; }
-    .hint { font-size: 11px; color: #9ca3af; margin-top: 5px; line-height: 1.45; }
-    .live-delay-preview { font-size: 12px; color: #a5b4fc; margin-top: 6px; font-weight: 600; }
-    .btn-row { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; margin: 18px 0 10px; }
-    button { border: none; border-radius: 999px; padding: 10px 22px; font-size: 13px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; }
-    .btn-primary { background: linear-gradient(135deg, #f59e0b, #ef4444); color: white; box-shadow: 0 10px 25px rgba(239, 68, 68, 0.5); }
-    .btn-secondary { background: rgba(99, 102, 241, 0.2); color: #a5b4fc; border: 1px solid rgba(99, 102, 241, 0.5); }
-    .btn-danger { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.5); }
-    .log, .preview-box { margin-top: 10px; font-size: 12px; font-family: monospace; white-space: pre-wrap; background: rgba(10, 15, 30, 0.9); border-radius: 10px; padding: 12px; border: 1px solid rgba(55,65,81,0.9); max-height: 280px; overflow: auto; }
-    .preview-box { display: none; border-color: rgba(99, 102, 241, 0.5); color: #c7d2fe; margin-bottom: 14px; }
+    :root {
+      --bg: #090b10;
+      --surface: #121621;
+      --surface-2: #181d2b;
+      --border: #252c3f;
+      --text: #e8ecf4;
+      --muted: #8b95ad;
+      --accent: #3b82f6;
+      --accent-hover: #2563eb;
+      --green: #10b981;
+      --red: #ef4444;
+      --amber: #f59e0b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: Inter, system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 24px 16px 48px;
+      line-height: 1.45;
+    }
+    .wrap { max-width: 980px; margin: 0 auto; }
+    .header {
+      display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
+      gap: 12px; margin-bottom: 20px;
+    }
+    .title h1 { font-size: 20px; margin: 0; font-weight: 700; letter-spacing: -0.01em; }
+    .title p { margin: 4px 0 0; font-size: 13px; color: var(--muted); }
+    .badge {
+      display: inline-flex; align-items: center; gap: 8px;
+      background: var(--surface); border: 1px solid var(--border);
+      padding: 8px 12px; border-radius: 999px; font-size: 13px; font-weight: 600;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+    .dot.live { background: var(--green); box-shadow: 0 0 8px var(--green); }
+    .dot.busy { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
+
+    .stats-grid {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+      gap: 12px; margin-bottom: 16px;
+    }
+    .stat-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 12px; padding: 14px 16px;
+    }
+    .stat-label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+    .stat-value { font-size: 24px; font-weight: 700; margin-top: 4px; color: #fff; }
+    .stat-sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+
+    .card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 12px; padding: 18px; margin-bottom: 16px;
+    }
+    .card-title { font-size: 14px; font-weight: 600; margin: 0 0 12px; color: #fff; display: flex; justify-content: space-between; align-items: center; }
+
+    label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin: 12px 0 6px; }
+    textarea, input {
+      width: 100%; background: var(--bg); color: var(--text);
+      border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+      font-size: 13.5px; font-family: inherit;
+    }
+    textarea:focus, input:focus { outline: none; border-color: var(--accent); }
+    .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    @media (max-width: 640px) { .grid-3 { grid-template-columns: 1fr; } }
+
+    .btn-row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+    button {
+      background: var(--accent); color: #fff; border: 0; border-radius: 8px;
+      padding: 10px 16px; font-size: 13.5px; font-weight: 600; cursor: pointer;
+      transition: background 0.15s;
+    }
+    button:hover { background: var(--accent-hover); }
+    button.sec { background: var(--surface-2); border: 1px solid var(--border); color: var(--text); }
+    button.sec:hover { background: #21283a; }
+
+    .progress-wrap { background: var(--bg); border: 1px solid var(--border); border-radius: 999px; height: 10px; overflow: hidden; margin-top: 10px; }
+    .progress-bar { height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent), var(--green)); transition: width 0.3s ease; }
+
+    .log-list { display: flex; flex-direction: column; gap: 8px; max-height: 420px; overflow-y: auto; }
+    .log-item {
+      background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+      padding: 10px 12px; font-size: 13px;
+    }
+    .log-meta { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; font-size: 11.5px; color: var(--muted); margin-bottom: 4px; }
+    .pill { padding: 2px 8px; border-radius: 999px; font-weight: 600; font-size: 11px; }
+    .pill.ok { background: rgba(16, 185, 129, 0.15); color: var(--green); }
+    .pill.err { background: rgba(239, 68, 68, 0.15); color: var(--red); }
+    .pill.dry { background: rgba(59, 130, 246, 0.15); color: var(--accent); }
+    .empty { color: var(--muted); font-size: 13px; padding: 12px 0; }
   </style>
 </head>
 <body>
-  <div class="container">
+  <div class="wrap">
+    <div class="header">
+      <div class="title">
+        <h1>The Unfiled Sessions — Comment Engine</h1>
+        <p>SMMFrog API v2 &bull; Service ID: <strong>{{ service_id }}</strong> &bull; Auto-convert mobile &rarr; PC link</p>
+      </div>
+      <div class="badge">
+        <span id="status-dot" class="dot"></span>
+        <span id="status-text">Spreman</span>
+      </div>
+    </div>
+
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-label">Poslano (ovaj batch)</div>
+        <div class="stat-value"><span id="sent-batch">0</span> / <span id="target-batch">0</span></div>
+        <div class="stat-sub">Videi: <span id="vid-progress">0 / 0</span></div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Ukupno poslano (sesija)</div>
+        <div class="stat-value" id="session-total">0</div>
+        <div class="stat-sub">Svi uspješni komentari</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Postavljeno po videu</div>
+        <div class="stat-value" id="per-video-stat">5</div>
+        <div class="stat-sub">Unikatni uglovi po klipu</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">SMMFrog Balans</div>
+        <div class="stat-value" id="balance-val">--</div>
+        <div class="stat-sub"><a href="#" onclick="checkBalance(); return false;" style="color:#60a5fa;text-decoration:none;">Osvježi balans</a></div>
+      </div>
+    </div>
+
     <div class="card">
-      <h1>⚡ TURBO TikTok Fixed 10 Sender</h1>
-      <div class="subtitle">
-        Fiksnih 10 provjerenih komentara • Bez spintaxa i varijacija • Direktno slanje na SMMFrog
+      <div class="card-title">
+        <span>Novi Task</span>
+        <span id="current-video-label" style="font-size:12px;color:var(--muted);font-weight:400;"></span>
       </div>
-
-      <div class="status-banner">
+      <label>TikTok Video URLs (mobile vm.tiktok.com ili PC link — automatski se pretvara u PC link)</label>
+      <textarea id="urls" rows="5" placeholder="https://vm.tiktok.com/ZM... ili https://www.tiktok.com/@username/video/..."></textarea>
+      <div class="grid-3">
         <div>
-          Status:
-          <span id="queue-badge" class="badge {% if queue_count > 0 or is_waiting %}badge-active{% else %}badge-idle{% endif %}">
-            {% if queue_count > 0 or is_waiting %}⚡ U TOKU (Turbo radi){% else %}✅ SPREMNO (Red prazan){% endif %}
-          </span>
+          <label>Komentara po videu</label>
+          <input id="count" type="number" value="5" min="1" max="20" oninput="updateTargetPreview()" />
         </div>
-        <div>Preostalo naloga: <b id="queue-count">{{ queue_count }}</b></div>
-        <div>Uspješno: <b id="sent-ok" style="color:#4ade80;">{{ sent_ok }}</b> | Fail: <b id="sent-fail" style="color:#f87171;">{{ sent_fail }}</b></div>
+        <div>
+          <label>Min delay između videa (s)</label>
+          <input id="min_delay" type="number" value="15" min="1" />
+        </div>
+        <div>
+          <label>Max delay između videa (s)</label>
+          <input id="max_delay" type="number" value="28" min="1" />
+        </div>
       </div>
-
-      <form method="post" action="/">
-        <label for="input_links">TikTok Video linkovi (jedan ispod drugog):</label>
-        <textarea id="input_links" name="input_links" placeholder="https://vt.tiktok.com/...&#10;https://www.tiktok.com/@user/video/..."></textarea>
-
-        <div style="display: flex; gap: 20px; flex-wrap: wrap; margin-top: 16px;">
-          <div style="flex: 1.3; min-width: 260px;">
-            <label for="send_mode">Režim brzine i slanja:</label><br>
-            <select name="send_mode" id="send_mode">
-              <option value="10_at_once" selected>🔥 PREPORUČENO (Turbo): Svih 10 komentara ODJEDNOM (1 order = 10 kom)</option>
-              <option value="2x5_rounds">🛡️ SREDNJE: Svih 10 komentara u 2 kruga (2 ordera x 5 kom)</option>
-              <option value="1x5_round">🚀 BRZO: Samo 5 komentara po linku (1 order = 5 kom)</option>
-            </select>
-
-            <div class="hint" style="margin-top: 10px;">
-              <label style="cursor:pointer;">
-                <input type="checkbox" name="shuffle_links" value="1" checked>
-                🔀 <b>Izmiješaj redoslijed linkova</b> (sprječava sekvencijalni pattern)
-              </label>
-            </div>
-          </div>
-
-          <div style="flex: 0.9; min-width: 220px;">
-            <label for="delay_minutes">Pauza između naloga (min ili 0.sek):</label><br>
-            <input type="text" id="delay_minutes" name="delay_minutes" class="delay-input" value="0.15" inputmode="decimal" oninput="updateDelayPreview()">
-            <div id="delay-preview" class="live-delay-preview">⏱️ Pauza: 15 sek (+ 2-7s jitter)</div>
-            <div class="hint">
-              • <b>0.10</b> = 10 sekundi<br>
-              • <b>0.15</b> = 15 sekundi (default)<br>
-              • <b>0.30</b> = 30 sekundi<br>
-              • <b>1</b> = 1 minuta
-            </div>
-          </div>
-        </div>
-
-        <div class="btn-row">
-          <button type="submit" name="action" value="add" class="btn-primary">⚡ POKRENI TURBO SLANJE</button>
-          <button type="button" class="btn-secondary" onclick="loadPreview()">👁️ Pogledaj svih 10 komentara</button>
-          <button type="submit" name="action" value="clear" class="btn-danger" onclick="return confirm('Sigurno želiš zaustaviti i isprazniti red?');">🛑 Zaustavi i očisti</button>
-        </div>
-      </form>
-
-      <div id="preview-box" class="preview-box"></div>
-
-      <div style="font-size: 12px; color: #9ca3af; margin-top: 10px; display:flex; justify-content:space-between;">
-        <b>Live Log:</b>
-        <span id="last-sync" style="font-size:11px; color:#64748b;"></span>
+      <div class="progress-wrap"><div id="progress-bar" class="progress-bar"></div></div>
+      <div class="btn-row">
+        <button onclick="sendJob()">Pošalji na SMMFrog</button>
+        <button class="sec" onclick="previewJob()">Dry-Run Preview (bez trošenja)</button>
+        <button class="sec" onclick="checkBalance()">Provjeri Balans</button>
       </div>
-      <div class="log" id="log-box">{{ log or 'Čekam zadatke...' }}</div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">
+        <span>Live Feed Poslanih Komentara</span>
+        <span id="log-count" style="font-size:12px;color:var(--muted);font-weight:400;">0 stavki</span>
+      </div>
+      <div id="log-list" class="log-list">
+        <div class="empty">Još nema poslanih komentara u ovoj sesiji.</div>
+      </div>
     </div>
   </div>
 
   <script>
-    function updateDelayPreview() {
-      const raw = (document.getElementById('delay_minutes').value || '').trim().replace(',', '.');
-      const preview = document.getElementById('delay-preview');
-      let totalSec = 15;
-      if (raw.includes('.')) {
-        const parts = raw.split('.');
-        const mins = parseInt(parts[0] || '0', 10);
-        const secs = parseInt(parts[1] || '0', 10);
-        if (!isNaN(mins) && !isNaN(secs)) totalSec = Math.max(3, mins * 60 + secs);
-      } else {
-        const mins = parseInt(raw, 10);
-        if (!isNaN(mins)) totalSec = Math.max(3, mins * 60);
-      }
-      preview.textContent = `⏱️ Pauza: ${totalSec} sek (+ 2-7s jitter)`;
+    function getUrls() {
+      return document.getElementById('urls').value.split('\\n').map(s => s.trim()).filter(Boolean);
     }
 
-    async function loadPreview() {
-      const box = document.getElementById('preview-box');
-      try {
-        const res = await fetch(`/preview?_=${Date.now()}`, { cache: 'no-store' });
-        const data = await res.json();
-        box.style.display = 'block';
-        box.textContent = '👁️ Fiksnih 10 komentara koji se šalju:\n\n' + data.comments.map((c, i) => `${i+1}. ${c}`).join('\n');
-      } catch (e) {}
+    function updateTargetPreview() {
+      const count = Number(document.getElementById('count').value) || 0;
+      document.getElementById('per-video-stat').textContent = count;
     }
 
-    async function refreshStatus() {
+    document.getElementById('urls').addEventListener('input', updateTargetPreview);
+
+    async function checkBalance() {
       try {
-        const res = await fetch(`/status?_=${Date.now()}`, { cache: 'no-store' });
-        if (!res.ok) return;
-        const data = await res.json();
-
-        document.getElementById('queue-count').textContent = data.queue_count;
-        document.getElementById('sent-ok').textContent = data.sent_ok;
-        document.getElementById('sent-fail').textContent = data.sent_fail;
-        document.getElementById('log-box').textContent = data.log || 'Čekam zadatke...';
-        document.getElementById('last-sync').textContent = 'Live sync: ' + new Date().toLocaleTimeString();
-
-        const badge = document.getElementById('queue-badge');
-        if (data.queue_count > 0 || data.is_waiting) {
-          badge.className = 'badge badge-active';
-          badge.textContent = '⚡ U TOKU (Turbo radi)';
+        const r = await fetch('/api/balance');
+        const data = await r.json();
+        if (data.balance !== undefined) {
+          document.getElementById('balance-val').textContent = '$' + Number(data.balance).toFixed(2);
         } else {
-          badge.className = 'badge badge-idle';
-          badge.textContent = '✅ SPREMNO (Red prazan)';
+          document.getElementById('balance-val').textContent = 'Err';
         }
       } catch (e) {
-      } finally {
-        setTimeout(refreshStatus, 1000);
+        document.getElementById('balance-val').textContent = 'Err';
       }
     }
 
-    document.addEventListener('DOMContentLoaded', () => {
-      updateDelayPreview();
-      refreshStatus();
-    });
+    function renderLogs(items, isDry = false) {
+      const list = document.getElementById('log-list');
+      document.getElementById('log-count').textContent = items.length + ' stavki';
+      if (!items.length) {
+        list.innerHTML = '<div class="empty">Još nema poslanih komentara u ovoj sesiji.</div>';
+        return;
+      }
+      list.innerHTML = items.map(item => {
+        let badge = '<span class="pill ok">Order #' + item.order_id + '</span>';
+        if (isDry) badge = '<span class="pill dry">DRY RUN</span>';
+        else if (item.error) badge = '<span class="pill err">' + escapeHtml(item.error) + '</span>';
+        return `
+          <div class="log-item">
+            <div class="log-meta">
+              <span>${item.time || 'Preview'} &bull; ${escapeHtml(item.video)}</span>
+              ${badge}
+            </div>
+            <div>${escapeHtml(item.comment)}</div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    function escapeHtml(str) {
+      return String(str || '').replace(/[&<>"']/g, s => ({
+        '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+      }[s]));
+    }
+
+    async function previewJob() {
+      const urls = getUrls();
+      const count = Number(document.getElementById('count').value) || 5;
+      const r = await fetch('/api/preview', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ urls, count })
+      });
+      const data = await r.json();
+      if (data.error) { alert(data.error); return; }
+      const flat = [];
+      for (const b of data.previews) {
+        for (const c of b.comments) flat.push({ video: b.link, comment: c });
+      }
+      document.getElementById('target-batch').textContent = flat.length;
+      document.getElementById('sent-batch').textContent = '0';
+      document.getElementById('vid-progress').textContent = '0 / ' + urls.length;
+      renderLogs(flat, true);
+    }
+
+    async function sendJob() {
+      const urls = getUrls();
+      const count = Number(document.getElementById('count').value) || 5;
+      if (!urls.length) { alert('Unesi bar jedan TikTok link.'); return; }
+      const r = await fetch('/api/send', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          urls,
+          count,
+          min_delay: Number(document.getElementById('min_delay').value) || 15,
+          max_delay: Number(document.getElementById('max_delay').value) || 28
+        })
+      });
+      const data = await r.json();
+      if (data.error) { alert(data.error); return; }
+      pollStatus();
+    }
+
+    async function pollStatus() {
+      try {
+        const r = await fetch('/status');
+        const data = await r.json();
+
+        document.getElementById('sent-batch').textContent = data.sent_comments;
+        document.getElementById('target-batch').textContent = data.target_comments;
+        document.getElementById('session-total').textContent = data.session_total_sent;
+        document.getElementById('vid-progress').textContent = data.completed_videos + ' / ' + data.total_videos;
+        document.getElementById('status-text').textContent = data.status_label || 'Spreman';
+        document.getElementById('current-video-label').textContent = data.current_video ? ('Trenutno: ' + data.current_video) : '';
+
+        const dot = document.getElementById('status-dot');
+        dot.className = 'dot ' + (data.running ? 'busy' : (data.session_total_sent > 0 ? 'live' : ''));
+
+        const pct = data.target_comments > 0 ? Math.min(100, Math.round((data.sent_comments / data.target_comments) * 100)) : 0;
+        document.getElementById('progress-bar').style.width = pct + '%';
+
+        if (data.sent_log && data.sent_log.length) {
+          renderLogs(data.sent_log, false);
+        }
+
+        if (data.running) {
+          setTimeout(pollStatus, 2000);
+        } else {
+          checkBalance();
+        }
+      } catch (e) {
+        setTimeout(pollStatus, 3000);
+      }
+    }
+
+    checkBalance();
+    pollStatus();
   </script>
 </body>
-</html>
-"""
+</html>"""
 
 
-@app.route("/", methods=["GET", "POST"])
+@app.route("/", methods=["GET"])
 def index():
-    if request.method == "POST":
-        action = request.form.get("action")
-        if action == "clear":
-            with queue_lock:
-                cleared = len(order_queue)
-                order_queue.clear()
-            add_log(f"🛑 Red čekanja je ispražnjen (obrisano {cleared} naloga).")
-            return redirect(url_for("index"))
-
-        elif action == "add":
-            raw_links = request.form.get("input_links", "")
-            raw_delay = request.form.get("delay_minutes", "0.15")
-            send_mode = request.form.get("send_mode", "10_at_once")
-            shuffle_links = request.form.get("shuffle_links") == "1"
-
-            delay_seconds = parse_delay_to_seconds(raw_delay)
-            links = list(dict.fromkeys([line.strip() for line in raw_links.splitlines() if line.strip()]))
-
-            if shuffle_links and len(links) > 1:
-                random.shuffle(links)
-
-            with queue_lock:
-                if send_mode == "10_at_once":
-                    for link in links:
-                        order_queue.append({
-                            "link": link,
-                            "comments": list(FIXED_COMMENTS),
-                            "batch_label": "10/10 Turbo",
-                            "delay": delay_seconds,
-                        })
-                elif send_mode == "1x5_round":
-                    for link in links:
-                        order_queue.append({
-                            "link": link,
-                            "comments": random.sample(FIXED_COMMENTS, 5),
-                            "batch_label": "5/5 Brzo",
-                            "delay": delay_seconds,
-                        })
-                else:
-                    # 2x5: prvi krug prvih 5, drugi krug drugih 5 (svih 10 bez duplikata)
-                    first_half = FIXED_COMMENTS[:5]
-                    second_half = FIXED_COMMENTS[5:10]
-                    for r_idx, batch_comments in enumerate([first_half, second_half]):
-                        round_links = list(links)
-                        if r_idx == 1 and len(round_links) > 1:
-                            random.shuffle(round_links)
-                        for link in round_links:
-                            order_queue.append({
-                                "link": link,
-                                "comments": list(batch_comments),
-                                "batch_label": f"Krug {r_idx + 1}/2",
-                                "delay": delay_seconds,
-                            })
-
-            if links:
-                add_log(
-                    f"⚡ TURBO START: Ubačeno {len(links)} linkova "
-                    f"(Mod: {send_mode}, Pauza: {delay_seconds}s + 2-7s jitter, Fiksnih 10 kom)."
-                )
-            return redirect(url_for("index"))
-
-    with queue_lock:
-        q_count = len(order_queue)
-        ok_c = sent_ok_count
-        fail_c = sent_fail_count
-        current_log = "\n".join(log_lines)
-        waiting = is_waiting
-
-    return render_template_string(
-        HTML_TEMPLATE,
-        queue_count=q_count,
-        is_waiting=waiting,
-        sent_ok=ok_c,
-        sent_fail=fail_c,
-        log=current_log,
-    )
+    return render_template_string(DASHBOARD_HTML, service_id=SERVICE_ID)
 
 
-@app.route("/preview")
-def preview():
-    resp = make_response(jsonify({"comments": FIXED_COMMENTS}))
-    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-    return resp
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "service_id": SERVICE_ID})
 
 
-@app.route("/status")
+@app.route("/status", methods=["GET"])
 def status():
-    with queue_lock:
-        resp = make_response(jsonify({
-            "queue_count": len(order_queue),
-            "sent_ok": sent_ok_count,
-            "sent_fail": sent_fail_count,
-            "is_waiting": is_waiting,
-            "log": "\n".join(log_lines),
-        }))
+    with JOB_LOCK:
+        resp = jsonify(dict(JOB_STATE))
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-    resp.headers["Pragma"] = "no-cache"
     return resp
+
+
+@app.route("/api/balance", methods=["GET"])
+def api_balance():
+    return jsonify(client.get_balance())
+
+
+@app.route("/api/order/<order_id>", methods=["GET"])
+def api_order_status(order_id: str):
+    return jsonify(client.check_order_status(order_id))
+
+
+@app.route("/api/preview", methods=["POST"])
+def api_preview():
+    data = request.get_json(silent=True) or {}
+    urls = [u.strip() for u in data.get("urls", []) if isinstance(u, str) and u.strip()]
+    count = int(data.get("count", 5))
+    if not urls:
+        return jsonify({"error": "Unesi bar jedan TikTok URL"}), 400
+    previews = [client.send_comments(video_url=u, count=count, dry_run=True) for u in urls]
+    return jsonify({"previews": previews})
+
+
+@app.route("/api/send", methods=["POST"])
+def api_send():
+    data = request.get_json(silent=True) or {}
+    urls = [u.strip() for u in data.get("urls", []) if isinstance(u, str) and u.strip()]
+    count = int(data.get("count", 5))
+    min_delay = float(data.get("min_delay", 15.0))
+    max_delay = float(data.get("max_delay", 28.0))
+
+    if not urls:
+        return jsonify({"error": "Unesi bar jedan TikTok URL"}), 400
+
+    with JOB_LOCK:
+        if JOB_STATE["running"]:
+            return jsonify({"error": "Slanje je već u toku"}), 409
+        JOB_STATE["running"] = True
+        JOB_STATE["status_label"] = "Pokrećem..."
+        JOB_STATE["total_videos"] = len(urls)
+        JOB_STATE["completed_videos"] = 0
+        JOB_STATE["target_comments"] = len(urls) * count
+        JOB_STATE["sent_comments"] = 0
+        JOB_STATE["current_video"] = ""
+        JOB_STATE["results"] = []
+        JOB_STATE["last_error"] = None
+
+    t = threading.Thread(
+        target=_run_batch_job,
+        args=(urls, count, min_delay, max_delay),
+        daemon=True,
+    )
+    t.start()
+    return jsonify({
+        "started": True,
+        "total_videos": len(urls),
+        "target_comments": len(urls) * count,
+        "count_per_video": count,
+    })
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
-
+    port = int(os.environ.get("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)
